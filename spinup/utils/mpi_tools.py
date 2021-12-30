@@ -54,6 +54,7 @@ def broadcast(x, root=0):
     MPI.COMM_WORLD.Bcast(x, root=root)
 
 def mpi_op(x, op):
+    # TODO this is not gpu compatible
     x, scalar = ([x], True) if np.isscalar(x) else (x, False)
     x = np.asarray(x, dtype=np.float32)
     buff = np.zeros_like(x, dtype=np.float32)

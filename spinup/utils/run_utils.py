@@ -86,7 +86,7 @@ def setup_logger_kwargs(exp_name, seed=None, data_dir=None, datestamp=False):
     return logger_kwargs
 
 
-def call_experiment(exp_name, thunk, seed=0, num_cpu=1, data_dir=None, 
+def call_experiment(exp_name, thunk, seed=None, num_cpu=1, data_dir=None, 
                     datestamp=False, **kwargs):
     """
     Run a function (thunk) with hyperparameters (kwargs), plus configuration.
@@ -154,6 +154,13 @@ def call_experiment(exp_name, thunk, seed=0, num_cpu=1, data_dir=None,
             env_name = kwargs['env_name']
             kwargs['env_fn'] = lambda : gym.make(env_name)
             del kwargs['env_name']
+        if "env_import" in kwargs:
+            if type(kwargs["env_import"]) is list:
+                for env_import in kwargs["env_import"]:
+                    __import__(env_import)
+            else:
+                __import__(kwargs["env_import"])
+            del kwargs['env_import']
 
         # Fork into multiple processes
         mpi_fork(num_cpu)

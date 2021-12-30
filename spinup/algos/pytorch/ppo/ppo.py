@@ -4,9 +4,12 @@ from torch.optim import Adam
 import gym
 import time
 import spinup.algos.pytorch.ppo.core as core
+import spinup.models.pytorch.multi_modal_net as model
 from spinup.utils.logx import EpochLogger
 from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
+
+from spinup.env_wrappers.env_wrapper_utils import wrap_envs
 
 
 class PPOBuffer:
@@ -15,9 +18,22 @@ class PPOBuffer:
     with the environment, and using Generalized Advantage Estimation (GAE-Lambda)
     for calculating the advantages of state-action pairs.
     """
+    def __init__(self, obs_dim_in, act_dim, size, cuda_device, gamma=0.99, lam=0.95):
+        self.dict_space = False
+        if np.isscalar(obs_dim_in):
+            obs_dim = {"obs":[obs_dim_in]}
+        elif isinstance(obs_dim_in, gym.spaces.Dict):
+            obs_dim = {k:v.shape for k,v in obs_dim_in.spaces.items()}
+            self.dict_space = True
+        else:
+            obs_dim = {"obs":obs_dim_in.shape}
+        self.obs_modalities = obs_dim.keys()
 
-    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
-        self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
+        if self.dict_space:
+            self.obs_buf = {k:np.zeros(core.combined_shape(size, v), dtype=np.float32) for k,v in obs_dim.items()}
+        else:
+            self.obs_buf = np.zeros(core.combined_shape(size, obs_dim_in.shape), dtype=np.float32)
+
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
         self.adv_buf = np.zeros(size, dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
@@ -26,13 +42,18 @@ class PPOBuffer:
         self.logp_buf = np.zeros(size, dtype=np.float32)
         self.gamma, self.lam = gamma, lam
         self.ptr, self.path_start_idx, self.max_size = 0, 0, size
+        self.cuda_device = cuda_device
 
     def store(self, obs, act, rew, val, logp):
         """
         Append one timestep of agent-environment interaction to the buffer.
         """
-        assert self.ptr < self.max_size     # buffer has to have room so you can store
-        self.obs_buf[self.ptr] = obs
+        #assert self.ptr < self.max_size     # buffer has to have room so you can store
+        if self.dict_space:
+            for k in self.obs_modalities:
+                self.obs_buf[k][self.ptr] = obs[k]
+        else:
+            self.obs_buf[self.ptr] = obs
         self.act_buf[self.ptr] = act
         self.rew_buf[self.ptr] = rew
         self.val_buf[self.ptr] = val
@@ -79,16 +100,54 @@ class PPOBuffer:
         # the next two lines implement the advantage normalization trick
         adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
         self.adv_buf = (self.adv_buf - adv_mean) / adv_std
-        data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
-                    adv=self.adv_buf, logp=self.logp_buf)
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in data.items()}
+
+        if self.dict_space:
+            data = dict(obs={k:self.obs_buf[k] for k in self.obs_buf},
+                        act=self.act_buf, ret=self.ret_buf,
+                        adv=self.adv_buf, logp=self.logp_buf)
+            return {k: {sub_k: torch.as_tensor(sub_v, dtype=torch.float32, device=self.cuda_device) for sub_k, sub_v in v.items()} 
+                    if k.startswith("obs") else 
+                    torch.as_tensor(v, dtype=torch.float32, device=self.cuda_device) for k,v in data.items()}
+        else:  
+            data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
+                        adv=self.adv_buf, logp=self.logp_buf)
+            return {k: torch.as_tensor(v, dtype=torch.float32, device=self.cuda_device) for k,v in data.items()}
 
 
-
-def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
-        vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.01, logger_kwargs=dict(), save_freq=10):
+def ppo(env_fn, 
+        actor_critic=core.ActorCritic, 
+        ac_kwargs={"model":model.net, "model_kwargs_getter":model.get_tanh_kwargs}, 
+        seed=None, 
+        steps_per_epoch=4000,
+        epochs=10000, 
+        gamma=0.99, 
+        clip_ratio=0.2, 
+        pi_lr=3e-4,
+        vf_lr=1e-3, 
+        train_pi_iters=80, 
+        train_v_iters=80, 
+        lam=0.97, 
+        max_ep_len=10000,
+        target_kl=-1, #0.05,
+        ent_coef=0.2,
+        logger_kwargs=dict(), 
+        save_freq=10, 
+        render_steps=True, 
+        cuda_device="cuda:0",
+        env_tools_kwargs={},
+        split_reward_streams=False, 
+        imitation_reward_weight=0,
+        normalize_env=False,
+        stack_size=0,
+        her_k=0,
+        her_reward=10.0,
+        signal_vector_size = 0,
+        output_pickle_trajectories=None,
+        max_skip=10,
+        greedy_adversarial_priors=False,
+        intrinsic_reward_weight=0,
+        #restore_model_path="D:/ml_frameworks/spinningup/data/2021-04-24_BipedalWalkerHardcore/pyt_save/model.pt"):
+        restore_model_path=None):
     """
     Proximal Policy Optimization (by clipping), 
 
@@ -189,7 +248,13 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         save_freq (int): How often (in terms of gap between epochs) to save
             the current policy and value function.
+        
+        render_steps (bool): Whether to render the individual trining steps.
+        
+        cuda_device (string): Name of the cuda device that will be used. Default "cuda:0".
 
+        restore_model_path (string): Path/to/model that will be restored to continue a training run. 
+            None by default, meaning that a newly initialized model will be used.
     """
 
     # Special function to avoid certain slowdowns from PyTorch + MPI combo.
@@ -200,35 +265,71 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     logger.save_config(locals())
 
     # Random seed
-    seed += 10000 * proc_id()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    if seed is not None:
+        seed += 10000 * proc_id()
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
     # Instantiate environment
     env = env_fn()
-    obs_dim = env.observation_space.shape
-    act_dim = env.action_space.shape
+    test_env = None
+    
+    env, test_env, intrinsic_reward_generators = wrap_envs(env=env, test_env=test_env,
+                                    env_tools_kwargs=env_tools_kwargs,
+                                    output_pickle_trajectories=output_pickle_trajectories,
+                                    imitation_reward_weight=imitation_reward_weight,
+                                    normalize=normalize_env,
+                                    max_skip=max_skip,
+                                    signal_vector_size=signal_vector_size,
+                                    stack_size=stack_size,
+                                    greedy_adversarial_priors=greedy_adversarial_priors,
+                                    split_reward_streams=split_reward_streams,
+                                    intrinsic_reward_weight=intrinsic_reward_weight,
+                                    her_k=her_k, 
+                                    her_reward=her_reward,
+                                    cuda_device=cuda_device,
+                                    model=model,
+                                    restore_model_path=restore_model_path,
+                                    render_steps=render_steps,
+                                    logger=logger)
 
+    n_agents = len(env.observation_space) # TODO I can't handle multi agent envs yet.
+    
+    obs_dim = [space for space in env.observation_space]
+    act_dim = [space.shape[0] for space in env.action_space]
+    dict_space = any([isinstance(o, gym.spaces.Dict) for o in obs_dim])
+    
     # Create actor-critic module
-    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+    if restore_model_path is None:
+        ac = [actor_critic(env.observation_space[i], env.action_space[i], **ac_kwargs) for i in range(n_agents)]
+    else:
+        # TODO careful, spinup does not use the recommended way of saving models in pytorch by saving just the state_dict (which doesn't depend on the projects current directory structure).
+        # Also, it does not restore an entire checkpoint with optimizer variables etc. - so strictly speaking, I can't really use it to resume training.
+        ac = torch.load(restore_model_path)
 
-    # Sync params across processes
-    sync_params(ac)
+    for i in range(n_agents):
+        if cuda_device is not None:
+            ac[i].to(cuda_device)
 
-    # Count variables
-    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.v])
-    logger.log('\nNumber of parameters: \t pi: %d, \t v: %d\n'%var_counts)
+        ac[i].eval()
+    
+        # Sync params across processes
+        sync_params(ac[i])
+
+        # Count variables
+        var_counts = tuple(core.count_vars(module) for module in [ac[i].pi, ac[i].v])
+        logger.log('\nNumber of parameters agent {}: \t pi: {}, \t v: {}\n'.format(i, *var_counts))
 
     # Set up experience buffer
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
-    buf = PPOBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
+    buf = [PPOBuffer(obs_dim[i], act_dim[i], local_steps_per_epoch, cuda_device, gamma, lam) for i in range(n_agents)]
 
     # Set up function for computing PPO policy loss
-    def compute_loss_pi(data):
+    def compute_loss_pi(agent_nbr, data):
         obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
-
+        
         # Policy loss
-        pi, logp = ac.pi(obs, act)
+        pi, logp = ac[agent_nbr].pi(obs, act)
         ratio = torch.exp(logp - logp_old)
         clip_adv = torch.clamp(ratio, 1-clip_ratio, 1+clip_ratio) * adv
         loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
@@ -240,48 +341,68 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         clipfrac = torch.as_tensor(clipped, dtype=torch.float32).mean().item()
         pi_info = dict(kl=approx_kl, ent=ent, cf=clipfrac)
 
+        # TODO why is ther no entropy coefficient being used? I'll try using one
+        loss_pi -= pi.entropy().mean() * ent_coef
+
+        if signal_vector_size > 0:
+            # Inspired by VICReg regularization for embedding vectors.
+            if hasattr(env, "get_signal_from_to_idx"):
+                signal_from_to = env.get_signal_from_to_idx(agent_nbr)
+                pi_sig = pi.mean[:,signal_from_to[0]:signal_from_to[1]]
+            else:
+                pi_sig = pi.mean
+            pi_norm = pi_sig - pi_sig.mean(dim=0)
+            cov_pi = (pi_sig.T @ pi_sig) / local_steps_per_epoch
+            off_diag_elems = torch.triu(cov_pi, diagonal=1)
+            decorelation_loss = off_diag_elems.pow(2).sum() / act_dim[agent_nbr]
+            loss_pi += decorelation_loss
+
+            # Let's also encourage high variance along the diagonal.
+            #loss_pi -= torch.diagonal(cov_pi).pow(2).sum() / act_dim[agent_nbr]
+
         return loss_pi, pi_info
 
     # Set up function for computing value loss
-    def compute_loss_v(data):
+    def compute_loss_v(agent_nbr, data):
         obs, ret = data['obs'], data['ret']
-        return ((ac.v(obs) - ret)**2).mean()
+        return ((ac[agent_nbr].v(obs) - ret)**2).mean()
 
     # Set up optimizers for policy and value function
-    pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
-    vf_optimizer = Adam(ac.v.parameters(), lr=vf_lr)
+    pi_optimizer = [Adam(ac[i].pi.parameters(), lr=pi_lr) for i in range(n_agents)]
+    vf_optimizer = [Adam(ac[i].v.parameters(), lr=vf_lr) for i in range(n_agents)]
 
     # Set up model saving
     logger.setup_pytorch_saver(ac)
 
-    def update():
-        data = buf.get()
+    def update(agent_nbr):
+        ac[agent_nbr].train()
+        data = buf[agent_nbr].get()
 
-        pi_l_old, pi_info_old = compute_loss_pi(data)
+        pi_l_old, pi_info_old = compute_loss_pi(agent_nbr, data)
         pi_l_old = pi_l_old.item()
-        v_l_old = compute_loss_v(data).item()
+        v_l_old = compute_loss_v(agent_nbr, data).item()
 
         # Train policy with multiple steps of gradient descent
         for i in range(train_pi_iters):
-            pi_optimizer.zero_grad()
-            loss_pi, pi_info = compute_loss_pi(data)
+            pi_optimizer[agent_nbr].zero_grad()
+            loss_pi, pi_info = compute_loss_pi(agent_nbr, data)
             kl = mpi_avg(pi_info['kl'])
-            if kl > 1.5 * target_kl:
-                logger.log('Early stopping at step %d due to reaching max kl.'%i)
+            if target_kl >= 0 and kl > 1.5 * target_kl:
+                logger.log(f'Early stopping at step {i} due to reaching max kl (kl: {kl}).')
                 break
             loss_pi.backward()
-            mpi_avg_grads(ac.pi)    # average grads across MPI processes
-            pi_optimizer.step()
+            mpi_avg_grads(ac[agent_nbr].pi)    # average grads across MPI processes
+            pi_optimizer[agent_nbr].step()
 
         logger.store(StopIter=i)
 
         # Value function learning
         for i in range(train_v_iters):
-            vf_optimizer.zero_grad()
-            loss_v = compute_loss_v(data)
+            vf_optimizer[agent_nbr].zero_grad()
+            loss_v = compute_loss_v(agent_nbr, data)
             loss_v.backward()
-            mpi_avg_grads(ac.v)    # average grads across MPI processes
-            vf_optimizer.step()
+            mpi_avg_grads(ac[agent_nbr].v)    # average grads across MPI processes
+            vf_optimizer[agent_nbr].step()
 
         # Log changes from update
         kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
@@ -289,29 +410,41 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                      KL=kl, Entropy=ent, ClipFrac=cf,
                      DeltaLossPi=(loss_pi.item() - pi_l_old),
                      DeltaLossV=(loss_v.item() - v_l_old))
+        ac[agent_nbr].eval()
 
     # Prepare for interaction with environment
     start_time = time.time()
-    o, ep_ret, ep_len = env.reset(), 0, 0
+    o, ep_ret, ep_len = env.reset(), np.zeros(n_agents), np.zeros(n_agents)
 
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
         for t in range(local_steps_per_epoch):
-            a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32))
+            actions, vs, logps = [], [], []
+            for i in range(n_agents):
+                a, v, logp = ac[i].step({k_o: torch.as_tensor(v_o, dtype=torch.float32, device=cuda_device) for k_o, v_o in o[i].items()} 
+                    if dict_space else torch.as_tensor(o[i], dtype=torch.float32, device=cuda_device))
+                actions.append(a)
+                vs.append(v)
+                logps.append(logp)
 
-            next_o, r, d, _ = env.step(a)
-            ep_ret += r
-            ep_len += 1
+            next_o, r, d, _ = env.step(np.array(actions))
+            for i in range(n_agents):
+                ep_ret[i] += r[i]
+                ep_len[i] += 1
+
+            if render_steps:
+                env.render()
 
             # save and log
-            buf.store(o, a, r, v, logp)
-            logger.store(VVals=v)
+            for i in range(n_agents):
+                buf[i].store(o[i], actions[i], r[i], vs[i], logps[i])
+                logger.store(VVals=vs[i])
             
             # Update obs (critical!)
             o = next_o
 
             timeout = ep_len == max_ep_len
-            terminal = d or timeout
+            terminal = any(d) or timeout
             epoch_ended = t==local_steps_per_epoch-1
 
             if terminal or epoch_ended:
@@ -319,14 +452,22 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                 # if trajectory didn't reach terminal state, bootstrap value target
                 if timeout or epoch_ended:
-                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
+                    vs = []
+                    for i in range(n_agents):
+                        _, v, _ = ac[i].step({k_o: torch.as_tensor(v_o, dtype=torch.float32, device=cuda_device) for k_o, v_o in o[i].items()} 
+                                            if dict_space else torch.as_tensor(o[i], dtype=torch.float32, device=cuda_device))
+                        vs.append(v)
+                    if render_steps:
+                        env.render()
                 else:
-                    v = 0
-                buf.finish_path(v)
+                    vs = np.zeros(n_agents)
+                
+                for i in range(n_agents):
+                    buf[i].finish_path(vs[i])
                 if terminal:
                     # only save EpRet / EpLen if trajectory finished
-                    logger.store(EpRet=ep_ret, EpLen=ep_len)
-                o, ep_ret, ep_len = env.reset(), 0, 0
+                    logger.store(EpRet=np.average(ep_ret), EpLen=np.average(ep_len))
+                o, ep_ret, ep_len = env.reset(), np.zeros(n_agents), np.zeros(n_agents)
 
 
         # Save model
@@ -334,7 +475,8 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             logger.save_state({'env': env}, None)
 
         # Perform PPO update!
-        update()
+        for i in range(n_agents):
+            update(i)
 
         # Log info about epoch
         logger.log_tabular('Epoch', epoch)
@@ -360,7 +502,7 @@ if __name__ == '__main__':
     parser.add_argument('--hid', type=int, default=64)
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--seed', '-s', type=int, default=0)
+    parser.add_argument('--seed', '-s', type=int, default=None)
     parser.add_argument('--cpu', type=int, default=4)
     parser.add_argument('--steps', type=int, default=4000)
     parser.add_argument('--epochs', type=int, default=50)

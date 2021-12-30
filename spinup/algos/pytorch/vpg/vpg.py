@@ -4,6 +4,7 @@ from torch.optim import Adam
 import gym
 import time
 import spinup.algos.pytorch.vpg.core as core
+import spinup.models.pytorch.mlp as model
 from spinup.utils.logx import EpochLogger
 from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
@@ -16,7 +17,7 @@ class VPGBuffer:
     for calculating the advantages of state-action pairs.
     """
 
-    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
+    def __init__(self, obs_dim, act_dim, size, cuda_device, gamma=0.99, lam=0.95):
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
         self.adv_buf = np.zeros(size, dtype=np.float32)
@@ -26,6 +27,7 @@ class VPGBuffer:
         self.logp_buf = np.zeros(size, dtype=np.float32)
         self.gamma, self.lam = gamma, lam
         self.ptr, self.path_start_idx, self.max_size = 0, 0, size
+        self.cuda_device = cuda_device
 
     def store(self, obs, act, rew, val, logp):
         """
@@ -81,14 +83,15 @@ class VPGBuffer:
         self.adv_buf = (self.adv_buf - adv_mean) / adv_std
         data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
                     adv=self.adv_buf, logp=self.logp_buf)
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in data.items()}
+        return {k: torch.as_tensor(v, dtype=torch.float32, device=self.cuda_device) for k,v in data.items()}
 
 
-
-def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0, 
+def vpg(env_fn, actor_critic=core.ActorCritic, ac_kwargs={"model":model.net, "model_kwargs_getter":model.get_tanh_kwargs},  seed=None, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, pi_lr=3e-4,
         vf_lr=1e-3, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        logger_kwargs=dict(), save_freq=10):
+        logger_kwargs=dict(), save_freq=10, render_steps=True, cuda_device="cuda:0",
+        #restore_model_path="D:/ml_frameworks/spinningup/data/2021-04-24_BipedalWalkerHardcore/pyt_save/model.pt"):
+        restore_model_path=None):
     """
     Vanilla Policy Gradient 
 
@@ -174,6 +177,12 @@ def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
         save_freq (int): How often (in terms of gap between epochs) to save
             the current policy and value function.
 
+        render_steps (bool): Whether to render the individual trining steps.
+       
+        cuda_device (string): Name of the cuda device that will be used. Default "cuda:0".
+
+        restore_model_path (string): Path/to/model that will be restored to continue a training run. 
+            None by default, meaning that a newly initialized model will be used.
     """
 
     # Special function to avoid certain slowdowns from PyTorch + MPI combo.
@@ -184,9 +193,10 @@ def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
     logger.save_config(locals())
 
     # Random seed
-    seed += 10000 * proc_id()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    if seed is not None:
+        seed += 10000 * proc_id()
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
     # Instantiate environment
     env = env_fn()
@@ -194,7 +204,17 @@ def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
     act_dim = env.action_space.shape
 
     # Create actor-critic module
-    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+    if restore_model_path is None:
+        ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+    else:
+        # TODO careful, spinup does not use the recommended way of saving models in pytorch by saving just the state_dict (which doesn't depend on the projects current directory structure).
+        # Also, it does not restore an entire checkpoint with optimizer variables etc. - so strictly speaking, I can't really use it to resume training.
+        ac = torch.load(restore_model_path)
+
+    if cuda_device is not None:
+        ac.to(cuda_device)
+    
+    ac.eval()
 
     # Sync params across processes
     sync_params(ac)
@@ -205,7 +225,7 @@ def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
 
     # Set up experience buffer
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
-    buf = VPGBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
+    buf = VPGBuffer(obs_dim, act_dim, local_steps_per_epoch, cuda_device, gamma, lam)
 
     # Set up function for computing VPG policy loss
     def compute_loss_pi(data):
@@ -235,6 +255,8 @@ def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
     logger.setup_pytorch_saver(ac)
 
     def update():
+        ac.train()
+
         data = buf.get()
 
         # Get loss and info values before update
@@ -263,6 +285,7 @@ def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
                      KL=kl, Entropy=ent,
                      DeltaLossPi=(loss_pi.item() - pi_l_old),
                      DeltaLossV=(loss_v.item() - v_l_old))
+        ac.eval()
 
     # Prepare for interaction with environment
     start_time = time.time()
@@ -271,11 +294,14 @@ def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
         for t in range(local_steps_per_epoch):
-            a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32))
+            a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32, device=cuda_device))
 
             next_o, r, d, _ = env.step(a)
             ep_ret += r
             ep_len += 1
+
+            if render_steps:
+                env.render()
 
             # save and log
             buf.store(o, a, r, v, logp)
@@ -293,7 +319,9 @@ def vpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(),  seed=0,
                     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                 # if trajectory didn't reach terminal state, bootstrap value target
                 if timeout or epoch_ended:
-                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
+                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32, device=cuda_device))
+                    if render_steps:
+                        env.render()
                 else:
                     v = 0
                 buf.finish_path(v)
@@ -332,7 +360,7 @@ if __name__ == '__main__':
     parser.add_argument('--hid', type=int, default=64)
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--seed', '-s', type=int, default=0)
+    parser.add_argument('--seed', '-s', type=int, default=None)
     parser.add_argument('--cpu', type=int, default=4)
     parser.add_argument('--steps', type=int, default=4000)
     parser.add_argument('--epochs', type=int, default=50)

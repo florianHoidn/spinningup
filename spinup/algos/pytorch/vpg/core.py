@@ -7,24 +7,13 @@ import torch.nn as nn
 from torch.distributions.normal import Normal
 from torch.distributions.categorical import Categorical
 
-
 def combined_shape(length, shape=None):
     if shape is None:
         return (length,)
     return (length, shape) if np.isscalar(shape) else (length, *shape)
 
-
-def mlp(sizes, activation, output_activation=nn.Identity):
-    layers = []
-    for j in range(len(sizes)-1):
-        act = activation if j < len(sizes)-2 else output_activation
-        layers += [nn.Linear(sizes[j], sizes[j+1]), act()]
-    return nn.Sequential(*layers)
-
-
 def count_vars(module):
     return sum([np.prod(p.shape) for p in module.parameters()])
-
 
 def discount_cumsum(x, discount):
     """
@@ -63,11 +52,13 @@ class Actor(nn.Module):
         return pi, logp_a
 
 
-class MLPCategoricalActor(Actor):
+class CategoricalActor(Actor):
     
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+    def __init__(self, obs_dim, act_dim, model, model_kwargs):
         super().__init__()
-        self.logits_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation)
+        model_kwargs["input_sizes"] = [obs_dim] + model_kwargs["input_sizes"]
+        model_kwargs["output_sizes"] += [act_dim]
+        self.logits_net = model(**model_kwargs)
 
     def _distribution(self, obs):
         logits = self.logits_net(obs)
@@ -77,13 +68,15 @@ class MLPCategoricalActor(Actor):
         return pi.log_prob(act)
 
 
-class MLPGaussianActor(Actor):
+class GaussianActor(Actor):
 
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+    def __init__(self, obs_dim, act_dim, model, model_kwargs):
         super().__init__()
         log_std = -0.5 * np.ones(act_dim, dtype=np.float32)
         self.log_std = torch.nn.Parameter(torch.as_tensor(log_std))
-        self.mu_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation)
+        model_kwargs["input_sizes"] = [obs_dim] + model_kwargs["input_sizes"]
+        model_kwargs["output_sizes"] += [act_dim]
+        self.mu_net = model(**model_kwargs)
 
     def _distribution(self, obs):
         mu = self.mu_net(obs)
@@ -94,34 +87,33 @@ class MLPGaussianActor(Actor):
         return pi.log_prob(act).sum(axis=-1)    # Last axis sum needed for Torch Normal distribution
 
 
-class MLPCritic(nn.Module):
+class Critic(nn.Module):
 
-    def __init__(self, obs_dim, hidden_sizes, activation):
+    def __init__(self, obs_dim, model, model_kwargs):
         super().__init__()
-        self.v_net = mlp([obs_dim] + list(hidden_sizes) + [1], activation)
+        model_kwargs["input_sizes"] = [obs_dim] + model_kwargs["input_sizes"]
+        model_kwargs["output_sizes"] += [1]
+        self.v_net = model(**model_kwargs)
 
     def forward(self, obs):
         return torch.squeeze(self.v_net(obs), -1) # Critical to ensure v has right shape.
 
 
+class ActorCritic(nn.Module):
 
-class MLPActorCritic(nn.Module):
-
-
-    def __init__(self, observation_space, action_space, 
-                 hidden_sizes=(64,64), activation=nn.Tanh):
+    def __init__(self, observation_space, action_space, model, model_kwargs_getter):
         super().__init__()
 
         obs_dim = observation_space.shape[0]
 
         # policy builder depends on action space
         if isinstance(action_space, Box):
-            self.pi = MLPGaussianActor(obs_dim, action_space.shape[0], hidden_sizes, activation)
+            self.pi = GaussianActor(obs_dim, action_space.shape[0], model, model_kwargs_getter())
         elif isinstance(action_space, Discrete):
-            self.pi = MLPCategoricalActor(obs_dim, action_space.n, hidden_sizes, activation)
+            self.pi = CategoricalActor(obs_dim, action_space.n, model, model_kwargs_getter())
 
         # build value function
-        self.v  = MLPCritic(obs_dim, hidden_sizes, activation)
+        self.v  = Critic(obs_dim, model, model_kwargs_getter())
 
     def step(self, obs):
         with torch.no_grad():
@@ -129,7 +121,7 @@ class MLPActorCritic(nn.Module):
             a = pi.sample()
             logp_a = self.pi._log_prob_from_distribution(pi, a)
             v = self.v(obs)
-        return a.numpy(), v.numpy(), logp_a.numpy()
+        return a.cpu().numpy(), v.cpu().numpy(), logp_a.cpu().numpy()
 
     def act(self, obs):
         return self.step(obs)[0]

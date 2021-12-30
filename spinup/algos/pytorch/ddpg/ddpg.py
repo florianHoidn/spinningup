@@ -5,25 +5,36 @@ from torch.optim import Adam
 import gym
 import time
 import spinup.algos.pytorch.ddpg.core as core
+import spinup.models.pytorch.mlp as model
 from spinup.utils.logx import EpochLogger
 
+from spinup.env_wrappers.env_wrapper_utils import wrap_envs
 
 class ReplayBuffer:
     """
-    A simple FIFO experience replay buffer for DDPG agents.
+    A simple FIFO experience replay buffer for SAC agents.
     """
 
-    def __init__(self, obs_dim, act_dim, size):
+    def __init__(self, obs_dim_in, act_dim, size, cuda_device):
+        if np.isscalar(obs_dim_in):
+            obs_dim = [obs_dim_in]
+        elif isinstance(obs_dim_in, gym.spaces.Dict):
+            obs_dim = np.concatenate([sub_obs.shape for sub_obs in obs_dim_in.spaces.values()], axis=-1)
+        else:
+            obs_dim = obs_dim_in.shape
+
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
         self.done_buf = np.zeros(size, dtype=np.float32)
+        self.cur_idxs = []
         self.ptr, self.size, self.max_size = 0, 0, size
+        self.cuda_device = cuda_device
 
     def store(self, obs, act, rew, next_obs, done):
-        self.obs_buf[self.ptr] = obs
-        self.obs2_buf[self.ptr] = next_obs
+        self.obs_buf[self.ptr] = obs if not isinstance(obs, dict) else np.concatenate([sub_obs for sub_obs in obs.values()], axis=-1)
+        self.obs2_buf[self.ptr] = next_obs if not isinstance(next_obs, dict) else np.concatenate([sub_obs for sub_obs in next_obs.values()], axis=-1)
         self.act_buf[self.ptr] = act
         self.rew_buf[self.ptr] = rew
         self.done_buf[self.ptr] = done
@@ -31,21 +42,27 @@ class ReplayBuffer:
         self.size = min(self.size+1, self.max_size)
 
     def sample_batch(self, batch_size=32):
-        idxs = np.random.randint(0, self.size, size=batch_size)
-        batch = dict(obs=self.obs_buf[idxs],
-                     obs2=self.obs2_buf[idxs],
-                     act=self.act_buf[idxs],
-                     rew=self.rew_buf[idxs],
-                     done=self.done_buf[idxs])
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
+        self.cur_idxs = np.random.randint(0, self.size, size=batch_size)
+        batch = dict(obs=self.obs_buf[self.cur_idxs],
+                     obs2=self.obs2_buf[self.cur_idxs],
+                     act=self.act_buf[self.cur_idxs],
+                     rew=self.rew_buf[self.cur_idxs],
+                     done=self.done_buf[self.cur_idxs])
+        return {k: torch.as_tensor(v, dtype=torch.float32, device=self.cuda_device) for k,v in batch.items()}
+
+    def update_prev_batch(self, new_priorities=None):
+        # TODO maybe I should remove this, I don't really need it and could get this to work properly yet.
+        pass
 
 
-
-def ddpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
-         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
-         polyak=0.995, pi_lr=1e-3, q_lr=1e-3, batch_size=100, start_steps=10000, 
+def ddpg(env_fn, actor_critic=core.ActorCritic, seed=None, ac_kwargs={"model":model.net, "model_kwargs_getter":model.get_default_kwargs}, 
+         env_wrapper_kwargs={},
+         steps_per_epoch=4000, epochs=100, replay_size=int(5e4), gamma=0.99, 
+         polyak=0.995, pi_lr=1e-3, q_lr=1e-3, batch_size=100, start_steps=1000, #10000, 
          update_after=1000, update_every=50, act_noise=0.1, num_test_episodes=10, 
-         max_ep_len=1000, logger_kwargs=dict(), save_freq=1):
+         max_ep_len=1000, logger_kwargs=dict(), save_freq=1, render_steps=True, cuda_device="cuda:0",
+        #restore_model_path="D:/ml_frameworks/spinningup/data/2021-04-24_BipedalWalkerHardcore/pyt_save/model.pt"):
+        restore_model_path=None):
     """
     Deep Deterministic Policy Gradient (DDPG)
 
@@ -127,75 +144,120 @@ def ddpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         save_freq (int): How often (in terms of gap between epochs) to save
             the current policy and value function.
+        
+        render_steps (bool): Whether to render the individual trining steps.
 
+        cuda_device (string): Name of the cuda device that will be used. Default "cuda:0".
+
+        restore_model_path (string): Path/to/model that will be restored to continue a training run. 
+            None by default, meaning that a newly initialized model will be used.
     """
 
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
-    env, test_env = env_fn(), env_fn()
-    obs_dim = env.observation_space.shape
-    act_dim = env.action_space.shape[0]
+    env = env_fn()
+    if num_test_episodes > 0:
+        test_env = env_fn()
+    else:
+        test_env = None
+
+    env, test_env, _ = wrap_envs(env=env, test_env=test_env, **env_wrapper_kwargs)
+
+    #env, test_env = env_fn(), env_fn()
+    ## Let's make sure that every incoming env can be treated as a multi agent env.
+    #if not type(env.observation_space) is list:
+    #    from spinup.env_wrappers.single_agent_env import SingleAgentEnv
+    #    env = SingleAgentEnv(env)
+    #    if num_test_episodes > 0:
+    #        test_env = SingleAgentEnv(test_env)
+
+    n_agents = len(env.observation_space)
+
+    obs_dim = [space for space in env.observation_space]
+    act_dim = [space.shape[0] for space in env.action_space]
 
     # Action limit for clamping: critically, assumes all dimensions share the same bound!
-    act_limit = env.action_space.high[0]
+    act_limit = [space.high[0] for space in env.action_space]
 
     # Create actor-critic module and target networks
-    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+    if restore_model_path is None:
+        ac = [actor_critic(env.observation_space[i], env.action_space[i], **ac_kwargs) for i in range(n_agents)]
+    else:
+        # TODO careful, spinup does not use the recommended way of saving models in pytorch by saving just the state_dict (which doesn't depend on the projects current directory structure).
+        # Also, it does not restore an entire checkpoint with optimizer variables etc. - so strictly speaking, I can't really use it to resume training.
+        ac = [torch.load(restore_model_path) for i in range(n_agents)]
     ac_targ = deepcopy(ac)
 
-    # Freeze target networks with respect to optimizers (only update via polyak averaging)
-    for p in ac_targ.parameters():
-        p.requires_grad = False
+    if cuda_device is not None:
+        for i in range(n_agents):
+            ac[i].to(cuda_device)
+            ac_targ[i].to(cuda_device)
 
-    # Experience buffer
-    replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size)
+    replay_buffers = []
+    for i in range(n_agents):
+        ac[i].eval()
+        ac_targ[i].eval()
 
-    # Count variables (protip: try to get a feel for how different size networks behave!)
-    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q])
-    logger.log('\nNumber of parameters: \t pi: %d, \t q: %d\n'%var_counts)
+        # Freeze target networks with respect to optimizers (only update via polyak averaging)
+        for p in ac_targ[i].parameters():
+            p.requires_grad = False
+
+        # Experience buffer
+        spinup_replay_buffer = ReplayBuffer(obs_dim_in=obs_dim[i], act_dim=act_dim[i], size=replay_size, cuda_device=cuda_device)
+        replay_buffers.append(spinup_replay_buffer)
+        # Count variables (protip: try to get a feel for how different size networks behave!)
+        var_counts = tuple(core.count_vars(module) for module in [ac[i].pi, ac[i].q])
+        logger.log("\nNumber of parameters agent " + str(i) + ": \t pi: %d, \t q: %d\n"%var_counts)
 
     # Set up function for computing DDPG Q-loss
-    def compute_loss_q(data):
+    def compute_loss_q(agent_nbr, data):
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
 
-        q = ac.q(o,a)
+        q = ac[agent_nbr].q(o,a)
 
         # Bellman backup for Q function
         with torch.no_grad():
-            q_pi_targ = ac_targ.q(o2, ac_targ.pi(o2))
+            q_pi_targ = ac_targ[agent_nbr].q(o2, ac_targ[agent_nbr].pi(o2))
             backup = r + gamma * (1 - d) * q_pi_targ
 
         # MSE loss against Bellman backup
         loss_q = ((q - backup)**2).mean()
 
         # Useful info for logging
-        loss_info = dict(QVals=q.detach().numpy())
+        loss_info = dict(QVals=q.detach().cpu().numpy())
 
         return loss_q, loss_info
 
     # Set up function for computing DDPG pi loss
-    def compute_loss_pi(data):
+    def compute_loss_pi(agent_nbr, data):
         o = data['obs']
-        q_pi = ac.q(o, ac.pi(o))
+        q_pi = ac[agent_nbr].q(o, ac[agent_nbr].pi(o))
         return -q_pi.mean()
 
     # Set up optimizers for policy and q-function
-    pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
-    q_optimizer = Adam(ac.q.parameters(), lr=q_lr)
+    pi_optimizer = []
+    q_optimizer = []
+    for i in range(n_agents):
+        pi_optimizer.append(Adam(ac[i].pi.parameters(), lr=pi_lr))
+        q_optimizer.append(Adam(ac[i].q.parameters(), lr=q_lr))
 
     # Set up model saving
     logger.setup_pytorch_saver(ac)
 
-    def update(data):
+    def update(agent_nbr, data):
+        ac[agent_nbr].train()
+        ac_targ[agent_nbr].train()
+
         # First run one gradient descent step for Q.
-        q_optimizer.zero_grad()
+        q_optimizer[agent_nbr].zero_grad()
         loss_q, loss_info = compute_loss_q(data)
         loss_q.backward()
-        q_optimizer.step()
+        q_optimizer[agent_nbr].step()
 
         # Freeze Q-network so you don't waste computational effort 
         # computing gradients for it during the policy learning step.
@@ -203,13 +265,13 @@ def ddpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             p.requires_grad = False
 
         # Next run one gradient descent step for pi.
-        pi_optimizer.zero_grad()
+        pi_optimizer[agent_nbr].zero_grad()
         loss_pi = compute_loss_pi(data)
         loss_pi.backward()
-        pi_optimizer.step()
+        pi_optimizer[agent_nbr].step()
 
         # Unfreeze Q-network so you can optimize it at next DDPG step.
-        for p in ac.q.parameters():
+        for p in ac[agent_nbr].q.parameters():
             p.requires_grad = True
 
         # Record things
@@ -217,31 +279,36 @@ def ddpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         # Finally, update target networks by polyak averaging.
         with torch.no_grad():
-            for p, p_targ in zip(ac.parameters(), ac_targ.parameters()):
+            for p, p_targ in zip(ac[agent_nbr].parameters(), ac_targ[agent_nbr].parameters()):
                 # NB: We use an in-place operations "mul_", "add_" to update target
                 # params, as opposed to "mul" and "add", which would make new tensors.
                 p_targ.data.mul_(polyak)
                 p_targ.data.add_((1 - polyak) * p.data)
+        ac[agent_nbr].eval()
+        ac_targ[agent_nbr].eval()
 
     def get_action(o, noise_scale):
-        a = ac.act(torch.as_tensor(o, dtype=torch.float32))
-        a += noise_scale * np.random.randn(act_dim)
+        # TODO It would be better if the actor critic let pytorch deal with the multi agent input (in parallel on the gpu).
+        a = np.array([ac[i].act({k_o: torch.as_tensor(v_o, dtype=torch.float32, device=cuda_device) for k_o, v_o in o[i].items()} 
+                                    if dict_space else torch.as_tensor(o[i], dtype=torch.float32, device=cuda_device), deterministic)
+                        for i in range(n_agents)])
+        a += np.array([noise_scale * np.random.randn(act_dim[i]) for i in range(n_agents)])
         return np.clip(a, -act_limit, act_limit)
 
     def test_agent():
         for j in range(num_test_episodes):
-            o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
-            while not(d or (ep_len == max_ep_len)):
+            o, d, ep_ret, ep_len = test_env.reset(), [False] * n_agents, np.zeros(n_agents), 0
+            while not(any(d) or (ep_len == max_ep_len)):
                 # Take deterministic actions at test time (noise_scale=0)
                 o, r, d, _ = test_env.step(get_action(o, 0))
-                ep_ret += r
+                ep_ret += np.array(r)
                 ep_len += 1
-            logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+            logger.store(TestEpRet=np.average(ep_ret), TestEpLen=ep_len)
 
     # Prepare for interaction with environment
     total_steps = steps_per_epoch * epochs
     start_time = time.time()
-    o, ep_ret, ep_len = env.reset(), 0, 0
+    o, ep_ret, ep_ret_ext, ep_ret_int, ep_len = env.reset(), np.zeros(n_agents), np.zeros(n_agents), np.zeros(n_agents), 0
 
     # Main loop: collect experience in env and update/log each epoch
     for t in range(total_steps):
@@ -252,35 +319,40 @@ def ddpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         if t > start_steps:
             a = get_action(o, act_noise)
         else:
-            a = env.action_space.sample()
+            a = np.array([space.sample() for space in env.action_space])
 
         # Step the env
         o2, r, d, _ = env.step(a)
         ep_ret += r
         ep_len += 1
 
+        if render_steps:
+            env.render()
+
         # Ignore the "done" signal if it comes from hitting the time
         # horizon (that is, when it's an artificial terminal signal
         # that isn't based on the agent's state)
-        d = False if ep_len==max_ep_len else d
+        #d = False if ep_len==max_ep_len else d # TODO here too, I'm not sure if the spinup author really wanted to do this.
 
         # Store experience to replay buffer
-        replay_buffer.store(o, a, r, o2, d)
+        for i in range(n_agents):
+            replay_buffers[i].store(o[i], a[i], r[i], o2[i], d[i])
 
         # Super critical, easy to overlook step: make sure to update 
         # most recent observation!
         o = o2
 
         # End of trajectory handling
-        if d or (ep_len == max_ep_len):
-            logger.store(EpRet=ep_ret, EpLen=ep_len)
-            o, ep_ret, ep_len = env.reset(), 0, 0
+        if np.any(d) or (ep_len == max_ep_len):
+            logger.store(EpRet=np.average(ep_ret), EpRetExternal=np.average(ep_ret_ext), EpRetInternal=np.average(ep_ret_int), EpLen=ep_len)
+            o, ep_ret, ep_ret_ext, ep_ret_int, ep_len = env.reset(), np.zeros(n_agents), np.zeros(n_agents), np.zeros(n_agents), 0
 
         # Update handling
         if t >= update_after and t % update_every == 0:
             for _ in range(update_every):
-                batch = replay_buffer.sample_batch(batch_size)
-                update(data=batch)
+                for i in range(n_agents):
+                    batch = replay_buffer[i].sample_batch(batch_size)
+                    update(agent_nbr=i, data=batch)
 
         # End of epoch handling
         if (t+1) % steps_per_epoch == 0:
@@ -313,7 +385,7 @@ if __name__ == '__main__':
     parser.add_argument('--hid', type=int, default=256)
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--seed', '-s', type=int, default=0)
+    parser.add_argument('--seed', '-s', type=int, default=None)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--exp_name', type=str, default='ddpg')
     args = parser.parse_args()

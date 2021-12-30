@@ -13,7 +13,6 @@ import torch
 from copy import deepcopy
 from textwrap import dedent
 
-
 # Command line args that will go to ExperimentGrid.run, and must possess unique
 # values (therefore must be treated separately).
 RUN_KEYS = ['num_cpu', 'data_dir', 'datestamp']
@@ -153,6 +152,12 @@ def parse_and_execute_grid_search(cmd, args):
 
     # Special handling for environment: make sure that env_name is a real,
     # registered gym environment.
+
+    # In case the user wants to import some special package like minerl that registers itself as a gym env, for example.
+    if "env_import" in arg_dict:
+        for env_import in arg_dict["env_import"]:
+            __import__(env_import)
+
     valid_envs = [e.id for e in list(gym.envs.registry.all())]
     assert 'env_name' in arg_dict, \
         friendly_err("You did not give a value for --env_name! Add one and try again.")

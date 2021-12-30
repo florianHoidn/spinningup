@@ -15,7 +15,7 @@ setup(
     version=__version__,#'0.1',
     install_requires=[
         'cloudpickle==1.2.1',
-        'gym[atari,box2d,classic_control]~=0.15.3',
+        'gym[atari,box2d,classic_control]>=0.15.3',#,<=0.15.7', #This may be needed when using python 3.6
         'ipython',
         'joblib',
         'matplotlib==3.1.1',
@@ -26,6 +26,7 @@ setup(
         'psutil',
         'scipy',
         'seaborn==0.8.1',
+        # TODO make this compatible with different versions and gpu support.
         'tensorflow>=1.8.0,<2.0',
         'torch==1.3.1',
         'tqdm'

@@ -363,7 +363,11 @@ class EpochLogger(Logger):
         if val is not None:
             super().log_tabular(key,val)
         else:
+            if not key in self.epoch_dict:
+                return
             v = self.epoch_dict[key]
+            if len(v) == 0:
+                return
             vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
             stats = mpi_statistics_scalar(vals, with_min_and_max=with_min_and_max)
             super().log_tabular(key if average_only else 'Average' + key, stats[0])

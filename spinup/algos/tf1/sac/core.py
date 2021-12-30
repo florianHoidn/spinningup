@@ -1,13 +1,20 @@
 import numpy as np
 import tensorflow as tf
+import gym
 
 EPS = 1e-8
 
 def placeholder(dim=None):
-    return tf.placeholder(dtype=tf.float32, shape=(None,dim) if dim else (None,))
+    #TODO not entirely sure if that's a very good way of dealing with this.
+    if isinstance(dim, gym.spaces.Dict):
+        return {sub_key:placeholder(sub_dim) for sub_key, sub_dim in dim.spaces.items()}
+    elif isinstance(dim, gym.spaces.Box):
+        return tf.placeholder(dtype=tf.float32, shape=(None,) + dim.shape)
+    else:
+        return tf.placeholder(dtype=tf.float32, shape=(None,dim) if dim else (None,))
 
 def placeholders(*args):
-    return [placeholder(dim) for dim in args]
+    return [[placeholder(dim) for dim in dims] for dims in args]
 
 def mlp(x, hidden_sizes=(32,), activation=tf.tanh, output_activation=None):
     for h in hidden_sizes[:-1]:
@@ -24,7 +31,6 @@ def count_vars(scope):
 def gaussian_likelihood(x, mu, log_std):
     pre_sum = -0.5 * (((x-mu)/(tf.exp(log_std)+EPS))**2 + 2*log_std + np.log(2*np.pi))
     return tf.reduce_sum(pre_sum, axis=1)
-
 
 """
 Policies
@@ -61,8 +67,15 @@ def apply_squashing_func(mu, pi, logp_pi):
 """
 Actor-Critics
 """
-def mlp_actor_critic(x, a, hidden_sizes=(256,256), activation=tf.nn.relu, 
+def mlp_actor_critic(x_in, a, hidden_sizes=(1024,512), activation=tf.nn.relu,
                      output_activation=None, policy=mlp_gaussian_policy, action_space=None):
+    
+    #TODO For now, let's handle multiple modalities by a simple concatenation.
+    if isinstance(x_in, dict):
+        x = tf.concat([sub_x for sub_x in x_in.values()], axis=-1)
+    else:
+        x = x_in
+
     # policy
     with tf.variable_scope('pi'):
         mu, pi, logp_pi = policy(x, a, hidden_sizes, activation, output_activation)

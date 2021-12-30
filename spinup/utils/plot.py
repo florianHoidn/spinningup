@@ -162,6 +162,53 @@ def make_plots(all_logdirs, legend=None, xaxis=None, values=None, count=False,
         plot_data(data, xaxis=xaxis, value=value, condition=condition, smooth=smooth, estimator=estimator)
     plt.show()
 
+class DynamicPlotter:
+    def __init__(self, plots=["data"], window_size=100, y_limits=[-0.5, 0.5], render_interval=10):
+        plt.ion()
+        self.fig, self.ax = plt.subplots()
+        plot_args = []
+        for _ in plots:
+            plot_args += [[],[],"-"]
+        mpl_plots = self.ax.plot(*plot_args)
+        self.data = {}
+        for i in range(len(plots)):
+            self.data[plots[i]]=([], [], mpl_plots[i])
+            mpl_plots[i].set_label(plots[i])
+        self.window_size = window_size
+        self.render_interval = render_interval
+        self.tick_counter = 0
+        self.orig_y_limits = y_limits
+        self.min_y = y_limits[0]
+        self.max_y = y_limits[1]
+        self.ax.set_ylim(self.orig_y_limits)
+        self.ax.set_xlim([0,window_size])
+        self.ax.legend()
+        plt.show()
+
+    def add_entry(self, entry, x_loc=None, plot="data"):
+        entries = self.data[plot]
+        entries[0].append(x_loc if x_loc is not None else self.tick_counter)
+        entries[1].append(entry)
+        if len(entries[0]) > self.window_size:
+            entries[0].pop(0)
+            entries[1].pop(0)
+        if entry < self.min_y:
+            self.min_y = entry + self.orig_y_limits[0]
+            self.ax.set_ylim([self.min_y, self.max_y])
+        if entry > self.max_y:
+            self.max_y = entry + self.orig_y_limits[1]
+            self.ax.set_ylim([self.min_y, self.max_y])
+
+    def plot(self):
+        if self.tick_counter % self.render_interval == 0:
+            for k,v in self.data.items():
+                v[2].set_xdata(v[0])
+                v[2].set_ydata(v[1])
+            if self.tick_counter > self.window_size:
+                self.ax.set_xlim([self.tick_counter - self.window_size, self.tick_counter])
+            self.fig.canvas.flush_events()
+        self.tick_counter += 1
+
 
 def main():
     import argparse
