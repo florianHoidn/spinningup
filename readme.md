@@ -1,32 +1,20 @@
-**Status:** Maintenance (expect bug fixes and minor updates)
+Welcome to my fork of OpenAi's Spinning Up repo
+===============================================
 
-Welcome to Spinning Up in Deep RL! 
-==================================
+When I started experimenting with spinning up for continuous control tasks, I noticed a couple of things that the original repo doesn't have. So I decided to create my own fork and add the stuff that I needed. Going forward, I'd like to use this repo to explore and document some of my own research ideas and do some cool RL experiments. Feel free to reach out and let me know what you think.
 
-This is an educational resource produced by OpenAI that makes it easier to learn about deep reinforcement learning (deep RL).
+Stuff that I've added
+---------------------
+Some of the changes that my fork has to offer are:
+- GPU support for the pytorch algorithms.
+- A more flexible way to create the models behind (some of) the pytorch algorithms.
+- Support for multi modal obervation spaces, including CNN models for pixel based observations.
+- A bunch of gym environment wrappers and techniques that I found useful - e.g., HER or random network distillation.
 
-For the unfamiliar: [reinforcement learning](https://en.wikipedia.org/wiki/Reinforcement_learning) (RL) is a machine learning approach for teaching agents how to solve tasks by trial and error. Deep RL refers to the combination of RL with [deep learning](http://ufldl.stanford.edu/tutorial/).
-
-This module contains a variety of helpful resources, including:
-
-- a short [introduction](https://spinningup.openai.com/en/latest/spinningup/rl_intro.html) to RL terminology, kinds of algorithms, and basic theory,
-- an [essay](https://spinningup.openai.com/en/latest/spinningup/spinningup.html) about how to grow into an RL research role,
-- a [curated list](https://spinningup.openai.com/en/latest/spinningup/keypapers.html) of important papers organized by topic,
-- a well-documented [code repo](https://github.com/openai/spinningup) of short, standalone implementations of key algorithms,
-- and a few [exercises](https://spinningup.openai.com/en/latest/spinningup/exercises.html) to serve as warm-ups.
-
-Get started at [spinningup.openai.com](https://spinningup.openai.com)!
-
-
-Citing Spinning Up
-------------------
-
-If you reference or use Spinning Up in your research, please cite:
-
-```
-@article{SpinningUp2018,
-    author = {Achiam, Joshua},
-    title = {{Spinning Up in Deep Reinforcement Learning}},
-    year = {2018}
-}
-```
+Some other cool RL projects that you might find interesting  
+-----------------------------------------------------------
+As I'd like to use this repo for my own experiments and can't really guarantee that everything will always be 100% correct, I thought that I could at least collect some links to other cool RL projects that I came across. So, if nothing else, the following list might at least help you to find a project that works for your RL tasks:
+- To get a really nice collection of RL algoritms, check out https://github.com/DLR-RM/stable-baselines3.
+- The stable baselines above can even be combined with a bunch of tools and pretrained weights from https://github.com/DLR-RM/rl-baselines3-zoo.
+- Another pretty powerful looking RL project is https://github.com/parilo/tars-rl.
+- And here's a framework that I liked to use when working with discrete action spaces: https://github.com/unixpickle/anyrl-py.
